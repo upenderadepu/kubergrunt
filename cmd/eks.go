@@ -6,9 +6,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/gruntwork-io/gruntwork-cli/entrypoint"
-	"github.com/gruntwork-io/gruntwork-cli/errors"
-	"github.com/gruntwork-io/gruntwork-cli/shell"
+	"github.com/gruntwork-io/go-commons/entrypoint"
+	"github.com/gruntwork-io/go-commons/errors"
+	"github.com/gruntwork-io/go-commons/shell"
 	"github.com/urfave/cli"
 
 	"github.com/gruntwork-io/kubergrunt/eks"
@@ -33,7 +33,7 @@ var (
 		Name:  "region",
 		Usage: "(Required) The AWS region code (e.g us-east-1) where the autoscaling group and EKS cluster is located.",
 	}
-	clusterAsgNameFlag = cli.StringFlag{
+	clusterAsgNameFlag = cli.StringSliceFlag{
 		Name:  "asg-name",
 		Usage: "(Required) The name of the autoscaling group that is a part of the EKS cluster.",
 	}
@@ -76,6 +76,20 @@ var (
 	oidcIssuerUrlFlag = cli.StringFlag{
 		Name:  "issuer-url",
 		Usage: "(Required) URL of the OIDC Issuer for which we want to retrieve CA certificate thumbprints for.",
+	}
+
+	// Flags for sync core components
+	syncSkipKubeProxyFlag = cli.BoolFlag{
+		Name:  "skip-kube-proxy",
+		Usage: "Whether or not to skip syncing kube-proxy service to EKS control plane version.",
+	}
+	syncSkipCoreDNSFlag = cli.BoolFlag{
+		Name:  "skip-coredns",
+		Usage: "Whether or not to skip syncing coredns service to EKS control plane version.",
+	}
+	syncSkipVPCCNIFlag = cli.BoolFlag{
+		Name:  "skip-aws-vpc-cni",
+		Usage: "Whether or not to skip syncing aws-vpc-cni service to EKS control plane version.",
 	}
 
 	// Flags for cleaning up security group
@@ -194,6 +208,9 @@ The versions deployed are based on what is listed in the official guide provided
 					eksClusterArnFlag,
 					waitFlag,
 					waitTimeoutFlag,
+					syncSkipKubeProxyFlag,
+					syncSkipCoreDNSFlag,
+					syncSkipVPCCNIFlag,
 				},
 			},
 			cli.Command{
@@ -228,6 +245,35 @@ If max-retries is unspecified, this command will use a value that translates to 
 					deleteLocalDataFlag,
 					waitMaxRetriesFlag,
 					waitSleepBetweenRetriesFlag,
+				},
+			},
+			cli.Command{
+				Name:  "drain",
+				Usage: "Drain all Pods from all instances in the provided Auto Scaling Groups.",
+				Description: `Drain Pods from the instances in the provided Auto Scaling Groups. This can be used to gracefully retire existing Auto Scaling Groups by ensuring the Pods are evicted in a manner that respects disruption budgets.
+
+You can read more about the drain operation in the official documentation: https://kubernetes.io/docs/tasks/administer-cluster/safely-drain-node/.
+
+To drain the Auto Scaling Group "my-asg" in the region "us-east-2":
+
+  kubergrunt eks drain --asg-name my-asg --region us-east-2
+
+You can also drain multiple ASGs by providing the "--asg-name" option multiple times:
+
+  kubergrunt eks drain --asg-name my-asg-a --asg-name my-asg-b --asg-name my-asg-c --region us-east-2
+`,
+				Action: drainASG,
+				Flags: []cli.Flag{
+					clusterRegionFlag,
+					clusterAsgNameFlag,
+					eksKubectlContextNameFlag,
+					genericKubeconfigFlag,
+					genericKubectlServerFlag,
+					genericKubectlCAFlag,
+					genericKubectlTokenFlag,
+					genericKubectlEKSClusterArnFlag,
+					drainTimeoutFlag,
+					deleteLocalDataFlag,
 				},
 			},
 			cli.Command{
@@ -349,10 +395,14 @@ func rollOutDeployment(cliContext *cli.Context) error {
 	if err != nil {
 		return errors.WithStackTrace(err)
 	}
-	asgName, err := entrypoint.StringFlagRequiredE(cliContext, clusterAsgNameFlag.Name)
-	if err != nil {
-		return errors.WithStackTrace(err)
+
+	// TODO: handle multiple ASGs correctly
+	asgNames := cliContext.StringSlice(clusterAsgNameFlag.Name)
+	if len(asgNames) != 1 {
+		return ExactlyOneASGErr{flagName: clusterAsgNameFlag.Name}
 	}
+	asgName := asgNames[0]
+
 	drainTimeout := cliContext.Duration(drainTimeoutFlag.Name)
 	deleteLocalData := cliContext.Bool(deleteLocalDataFlag.Name)
 	waitMaxRetries := cliContext.Int(waitMaxRetriesFlag.Name)
@@ -369,6 +419,34 @@ func rollOutDeployment(cliContext *cli.Context) error {
 	)
 }
 
+// Command action for `kubergrunt eks drain`
+func drainASG(cliContext *cli.Context) error {
+	kubectlOptions, err := parseKubectlOptions(cliContext)
+	if err != nil {
+		return err
+	}
+
+	region, err := entrypoint.StringFlagRequiredE(cliContext, clusterRegionFlag.Name)
+	if err != nil {
+		return errors.WithStackTrace(err)
+	}
+
+	asgNames := cliContext.StringSlice(clusterAsgNameFlag.Name)
+	if len(asgNames) == 0 {
+		return entrypoint.NewRequiredArgsError("You must provide at least one ASG Name with --asg-name.")
+	}
+
+	drainTimeout := cliContext.Duration(drainTimeoutFlag.Name)
+	deleteLocalData := cliContext.Bool(deleteLocalDataFlag.Name)
+	return eks.DrainASG(
+		region,
+		asgNames,
+		kubectlOptions,
+		drainTimeout,
+		deleteLocalData,
+	)
+}
+
 // Command action for `kubergrunt eks sync-core-components`
 func syncClusterComponents(cliContext *cli.Context) error {
 	eksClusterArn, err := entrypoint.StringFlagRequiredE(cliContext, eksClusterArnFlag.Name)
@@ -377,7 +455,10 @@ func syncClusterComponents(cliContext *cli.Context) error {
 	}
 	shouldWait := cliContext.Bool(waitFlag.Name)
 	waitTimeout := cliContext.String(waitTimeoutFlag.Name)
-	return eks.SyncClusterComponents(eksClusterArn, shouldWait, waitTimeout)
+	skipKubeProxy := cliContext.Bool(syncSkipKubeProxyFlag.Name)
+	skipCoreDNS := cliContext.Bool(syncSkipCoreDNSFlag.Name)
+	skipVPCCNI := cliContext.Bool(syncSkipVPCCNIFlag.Name)
+	return eks.SyncClusterComponents(eksClusterArn, shouldWait, waitTimeout, eks.SkipComponentsConfig{KubeProxy: skipKubeProxy, CoreDNS: skipCoreDNS, VPCCNI: skipVPCCNI})
 }
 
 // Command action for `kubergrunt eks cleanup-security-group`

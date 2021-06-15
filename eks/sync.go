@@ -14,9 +14,10 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/blang/semver/v4"
-	"github.com/gruntwork-io/gruntwork-cli/collections"
-	"github.com/gruntwork-io/gruntwork-cli/errors"
+	"github.com/gruntwork-io/go-commons/collections"
+	"github.com/gruntwork-io/go-commons/errors"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -29,30 +30,30 @@ import (
 
 var (
 	// NOTE: Ensure that there is an entry for each supported version in the following tables.
-	supportedVersions = []string{"1.18", "1.17", "1.16", "1.15", "1.14"}
+	supportedVersions = []string{"1.20", "1.19", "1.18", "1.17", "1.16"}
 
 	coreDNSVersionLookupTable = map[string]string{
+		"1.20": "1.8.3-eksbuild.1",
+		"1.19": "1.8.0-eksbuild.1",
 		"1.18": "1.7.0-eksbuild.1",
 		"1.17": "1.6.6-eksbuild.1",
 		"1.16": "1.6.6-eksbuild.1",
-		"1.15": "1.6.6-eksbuild.1",
-		"1.14": "1.6.6-eksbuild.1",
 	}
 
 	kubeProxyVersionLookupTable = map[string]string{
+		"1.20": "1.20.4-eksbuild.1",
+		"1.19": "1.19.6-eksbuild.1",
 		"1.18": "1.18.8-eksbuild.1",
 		"1.17": "1.17.9-eksbuild.1",
 		"1.16": "1.16.13-eksbuild.1",
-		"1.15": "1.15.11-eksbuild.1",
-		"1.14": "1.14.9-eksbuild.1",
 	}
 
 	amazonVPCCNIVersionLookupTable = map[string]string{
+		"1.20": "1.7.5",
+		"1.19": "1.7.5",
 		"1.18": "1.7.5",
 		"1.17": "1.7.5",
 		"1.16": "1.7.5",
-		"1.15": "1.7.5",
-		"1.14": "1.7.5",
 	}
 )
 
@@ -60,9 +61,20 @@ const (
 	componentNamespace        = "kube-system"
 	kubeProxyDaemonSetName    = "kube-proxy"
 	corednsDeploymentName     = "coredns"
+	corednsClusterRoleName    = "system:coredns"
 	corednsConfigMapName      = "coredns"
 	corednsConfigMapConfigKey = "Corefile"
+
+	endpointslicesAPIGroup = "discovery.k8s.io"
+	endpointslicesResource = "endpointslices"
 )
+
+// SkipComponentsConfig represents the components that should be skipped in the sync command.
+type SkipComponentsConfig struct {
+	KubeProxy bool
+	CoreDNS   bool
+	VPCCNI    bool
+}
 
 // SyncClusterComponents will perform the steps described in
 // https://docs.aws.amazon.com/eks/latest/userguide/update-cluster.html
@@ -80,6 +92,7 @@ func SyncClusterComponents(
 	eksClusterArn string,
 	shouldWait bool,
 	waitTimeout string,
+	skipConfig SkipComponentsConfig,
 ) error {
 	logger := logging.GetProjectLogger()
 
@@ -97,10 +110,17 @@ func SyncClusterComponents(
 	kubeProxyVersion := kubeProxyVersionLookupTable[k8sVersion]
 	coreDNSVersion := coreDNSVersionLookupTable[k8sVersion]
 	amznVPCCNIVersion := amazonVPCCNIVersionLookupTable[k8sVersion]
+
 	logger.Info("Syncing Kubernetes Applications to:")
-	logger.Infof("\tkube-proxy:\t%s", kubeProxyVersion)
-	logger.Infof("\tcoredns:\t%s", coreDNSVersion)
-	logger.Infof("\tVPC CNI Plugin:\t%s", amznVPCCNIVersion)
+	if !skipConfig.KubeProxy {
+		logger.Infof("\tkube-proxy:\t%s", kubeProxyVersion)
+	}
+	if !skipConfig.CoreDNS {
+		logger.Infof("\tcoredns:\t%s", coreDNSVersion)
+	}
+	if !skipConfig.VPCCNI {
+		logger.Infof("\tVPC CNI Plugin:\t%s", amznVPCCNIVersion)
+	}
 
 	kubectlOptions := &kubectl.KubectlOptions{EKSClusterArn: eksClusterArn}
 	clientset, err := kubectl.GetKubernetesClientFromOptions(kubectlOptions)
@@ -112,14 +132,29 @@ func SyncClusterComponents(
 	if err != nil {
 		return err
 	}
-	if err := upgradeKubeProxy(kubectlOptions, clientset, awsRegion, kubeProxyVersion, shouldWait, waitTimeout); err != nil {
-		return err
+
+	if skipConfig.KubeProxy {
+		logger.Info("Skipping kube-proxy sync.")
+	} else {
+		if err := upgradeKubeProxy(kubectlOptions, clientset, awsRegion, kubeProxyVersion, shouldWait, waitTimeout); err != nil {
+			return err
+		}
 	}
-	if err := upgradeCoreDNS(kubectlOptions, clientset, awsRegion, coreDNSVersion, shouldWait, waitTimeout); err != nil {
-		return err
+
+	if skipConfig.CoreDNS {
+		logger.Info("Skipping coredns sync.")
+	} else {
+		if err := upgradeCoreDNS(kubectlOptions, clientset, awsRegion, coreDNSVersion, shouldWait, waitTimeout); err != nil {
+			return err
+		}
 	}
-	if err := updateVPCCNI(kubectlOptions, awsRegion, amznVPCCNIVersion); err != nil {
-		return err
+
+	if skipConfig.VPCCNI {
+		logger.Info("Skipping aws-vpc-cni.")
+	} else {
+		if err := updateVPCCNI(kubectlOptions, awsRegion, amznVPCCNIVersion); err != nil {
+			return err
+		}
 	}
 
 	logger.Info("Successfully updated core components.")
@@ -220,6 +255,37 @@ func upgradeCoreDNS(
 ) error {
 	logger := logging.GetProjectLogger()
 
+	logger.Info("Confirming compatibility of coredns configuration with latest version.")
+	// Need to check config for backwards incompatibility if updating to version >= 1.7.0. The keyword `upstream` was
+	// removed in 1.7 series of coredns, but is used in earlier versions.
+	compareVal170, err := semverStringCompare(coreDNSVersion, "1.7.0-eksbuild.1")
+	if err != nil {
+		return err
+	}
+	// Looking for 1 or 0 here, since we want to know when coreDNSVersion is >= 1.7.0
+	if compareVal170 >= 0 {
+		if err := updateCorednsConfigMapFor170Compatibility(clientset); err != nil {
+			return err
+		}
+	} else {
+		logger.Info("Configuration for coredns is up to date. Skipping configuration reformat.")
+	}
+
+	logger.Info("Confirming compatibility of coredns permissions with latest version.")
+	// Need to check permissions compatibility if updating to version >= 1.8.3. Starting with 1.8.3, coredns requires
+	// permissions to list and watch endpoint slices.
+	compareVal183, err := semverStringCompare(coreDNSVersion, "1.8.3-eksbuild.1")
+	if err != nil {
+		return err
+	}
+	if compareVal183 >= 0 {
+		if err := updateCorednsPermissionsFor183Compatibility(clientset); err != nil {
+			return err
+		}
+	} else {
+		logger.Info("ClusterRole permissions for coredns is up to date. Skipping adjusting ClusterRole permissions.")
+	}
+
 	targetImage := fmt.Sprintf("602401143452.dkr.ecr.%s.amazonaws.com/eks/coredns:v%s", awsRegion, coreDNSVersion)
 	currentImage, err := getCurrentDeployedCoreDNSImage(clientset)
 	if err != nil {
@@ -228,27 +294,6 @@ func upgradeCoreDNS(
 	if currentImage == targetImage {
 		logger.Info("Current deployed version matches expected version. Skipping coredns update.")
 		return nil
-	}
-
-	logger.Info("Confirming compatibility of coredns configuration with latest version.")
-	corednsConfigMap, err := getCorednsConfigMap(clientset)
-	if err != nil {
-		return err
-	}
-	// Need to check config for backwards incompatibility if updating to version >= 1.7.0. The keyword upstream was
-	// removed in 1.7 series of coredns, but is used in earlier versions.
-	compareVal, err := semverStringCompare(coreDNSVersion, "1.7.0-eksbuild.1")
-	if err != nil {
-		return err
-	}
-	// Looking for 1 or 0 here, since we want to know when coreDNSVersion is >= 1.7.0
-	if compareVal >= 0 && strings.Contains(corednsConfigMap.Data[corednsConfigMapConfigKey], "upstream") {
-		logger.Info("Detected old configuration for coredns. Reformatting configuration to latest.")
-		if err := removeUpstreamKeywordFromCorednsConfigMap(clientset, corednsConfigMap); err != nil {
-			return err
-		}
-	} else {
-		logger.Info("Configuration for coredns is up to date. Skipping configuration reformat.")
 	}
 
 	logger.Infof("Upgrading current deployed version of coredns (%s) to match expected version (%s).", currentImage, targetImage)
@@ -271,6 +316,81 @@ func upgradeCoreDNS(
 		return kubectl.RunKubectl(kubectlOptions, args...)
 	}
 	return nil
+}
+
+// updateCorednsConfigMapFor170Compatibility updates the ConfigMap to remove traces of the upstream keyword, which was
+// removed starting with 1.7.0.
+func updateCorednsConfigMapFor170Compatibility(clientset *kubernetes.Clientset) error {
+	logger := logging.GetProjectLogger()
+	corednsConfigMap, err := getCorednsConfigMap(clientset)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(corednsConfigMap.Data[corednsConfigMapConfigKey], "upstream") {
+		logger.Info("Detected old configuration for coredns. Reformatting configuration to latest.")
+		if err := removeUpstreamKeywordFromCorednsConfigMap(clientset, corednsConfigMap); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// updateCorednsPermissionsFor183Compatibility updates the coredns ClusterRole to include permissions that are
+// additionally needed starting with 1.8.3.
+func updateCorednsPermissionsFor183Compatibility(clientset *kubernetes.Clientset) error {
+	logger := logging.GetProjectLogger()
+
+	corednsClusterRole, err := getCorednsClusterRole(clientset)
+	if err != nil {
+		return err
+	}
+	// Check if any of the policy rules overlap with list/watch permissions for endpointslices
+	hasListEndpointSlicesRule, hasWatchEndpointSlicesRule := hasEndpointSlicesPermissions(corednsClusterRole.Rules)
+	if hasListEndpointSlicesRule && hasWatchEndpointSlicesRule {
+		// Already have the necessary permissions, so do nothing
+		return nil
+	}
+
+	logger.Info("coredns ClusterRole does not have enough permissions for 1.8.3. Updating ClusterRole.")
+
+	// Construct new rule that contains the necessary permissions
+	newRule := rbacv1.PolicyRule{
+		APIGroups: []string{endpointslicesAPIGroup},
+		Resources: []string{endpointslicesResource},
+	}
+	if !hasListEndpointSlicesRule {
+		newRule.Verbs = append(newRule.Verbs, "list")
+	}
+	if !hasWatchEndpointSlicesRule {
+		newRule.Verbs = append(newRule.Verbs, "watch")
+	}
+	corednsClusterRole.Rules = append(corednsClusterRole.Rules, newRule)
+
+	// Now save the updated ClusterRole
+	clusterRoleAPI := clientset.RbacV1().ClusterRoles()
+	_, err = clusterRoleAPI.Update(context.Background(), corednsClusterRole, metav1.UpdateOptions{})
+	return errors.WithStackTrace(err)
+}
+
+// hasEndpointSlicesPermissions checks if the given rules contain the rule for providing list and watch permissions to
+// endpointslices. Returns a 2-tuple where the first element indicates having list permissions, and the latter indicates
+// having watch permissions.
+func hasEndpointSlicesPermissions(rules []rbacv1.PolicyRule) (bool, bool) {
+	hasListEndpointSlicesRule := false
+	hasWatchEndpointSlicesRule := false
+	for _, rule := range rules {
+		ruleIsForDiscoveryAPI := collections.ListContainsElement(rule.APIGroups, endpointslicesAPIGroup)
+		ruleIsForEndpointSlices := collections.ListContainsElement(rule.Resources, endpointslicesResource) || collections.ListContainsElement(rule.Resources, rbacv1.ResourceAll)
+		ruleIsForList := collections.ListContainsElement(rule.Verbs, "list") || collections.ListContainsElement(rule.Verbs, rbacv1.VerbAll)
+		ruleIsForWatch := collections.ListContainsElement(rule.Verbs, "watch") || collections.ListContainsElement(rule.Verbs, rbacv1.VerbAll)
+		if ruleIsForDiscoveryAPI && ruleIsForEndpointSlices && ruleIsForList {
+			hasListEndpointSlicesRule = true
+		}
+		if ruleIsForDiscoveryAPI && ruleIsForEndpointSlices && ruleIsForWatch {
+			hasWatchEndpointSlicesRule = true
+		}
+	}
+	return hasListEndpointSlicesRule, hasWatchEndpointSlicesRule
 }
 
 // getCurrentDeployedCoreDNSImage will return the currently configured coredns image on the deployment.
@@ -320,6 +440,16 @@ func getCorednsConfigMap(clientset *kubernetes.Clientset) (*corev1.ConfigMap, er
 		return nil, errors.WithStackTrace(err)
 	}
 	return configMap, nil
+}
+
+// getCorednsClusterRole returns the ClusterRole object for coredns.
+func getCorednsClusterRole(clientset *kubernetes.Clientset) (*rbacv1.ClusterRole, error) {
+	clusterRoleAPI := clientset.RbacV1().ClusterRoles()
+	corednsClusterRole, err := clusterRoleAPI.Get(context.Background(), corednsClusterRoleName, metav1.GetOptions{})
+	if err != nil {
+		return nil, errors.WithStackTrace(err)
+	}
+	return corednsClusterRole, nil
 }
 
 // getBaseURLForVPCCNIManifest returns the base github URL where the manifest for the VPC CNI is located given the

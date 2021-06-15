@@ -3,13 +3,14 @@ defaults: &defaults
     enabled: true
     image: "ubuntu-1604:201903-01"
   environment:
-    GRUNTWORK_INSTALLER_VERSION: v0.0.21
+    GRUNTWORK_INSTALLER_VERSION: v0.0.35
     TERRATEST_LOG_PARSER_VERSION: v0.29.0
-    MODULE_CI_VERSION: v0.28.3
-    TERRAFORM_VERSION: 0.13.5
+    MODULE_CI_VERSION: v0.33.1
+    TERRAFORM_VERSION: 0.14.9
     TERRAGRUNT_VERSION: NONE
     PACKER_VERSION: NONE
-    GOLANG_VERSION: 1.14
+    GOLANG_VERSION: 1.16
+    GO111MODULE: auto
     KUBECTL_VERSION: v1.17.12
     MINIKUBE_VERSION: v1.11.0
     KUBECONFIG: /home/circleci/.kube/config
@@ -17,14 +18,15 @@ install_gruntwork_utils: &install_gruntwork_utils
   name: install gruntwork utils
   command: |
     curl -Ls https://raw.githubusercontent.com/gruntwork-io/gruntwork-installer/master/bootstrap-gruntwork-installer.sh | bash /dev/stdin --version "${GRUNTWORK_INSTALLER_VERSION}"
-    gruntwork-install --module-name "gruntwork-module-circleci-helpers" --repo "https://github.com/gruntwork-io/module-ci" --tag "${MODULE_CI_VERSION}"
-    gruntwork-install --module-name "kubernetes-circleci-helpers" --repo "https://github.com/gruntwork-io/module-ci" --tag "${MODULE_CI_VERSION}"
+    gruntwork-install --module-name "gruntwork-module-circleci-helpers" --repo "https://github.com/gruntwork-io/terraform-aws-ci" --tag "${MODULE_CI_VERSION}"
+    gruntwork-install --module-name "kubernetes-circleci-helpers" --repo "https://github.com/gruntwork-io/terraform-aws-ci" --tag "${MODULE_CI_VERSION}"
     gruntwork-install --binary-name "terratest_log_parser" --repo "https://github.com/gruntwork-io/terratest" --tag "${TERRATEST_LOG_PARSER_VERSION}"
     configure-environment-for-gruntwork-module \
       --terraform-version ${TERRAFORM_VERSION} \
       --terragrunt-version ${TERRAGRUNT_VERSION} \
       --packer-version ${PACKER_VERSION} \
-      --go-version ${GOLANG_VERSION}
+      --go-version ${GOLANG_VERSION} \
+      --kubectl-version NONE # We install kubectl in the minikube step
 version: 2
 jobs:
   kubergrunt_tests:
@@ -67,7 +69,7 @@ jobs:
               --ld-flags "-X main.VERSION=$CIRCLE_TAG -extldflags '-static'"
             (cd ./bin && sha256sum * > SHA256SUMS)
             upload-github-release-assets ./bin/*
-          no_output_timeout: 900s
+          no_output_timeout: 1800s
 workflows:
   version: 2
   test-and-deploy:
@@ -79,8 +81,6 @@ workflows:
           context:
             - Gruntwork Admin
       - deploy:
-          requires:
-            - kubergrunt_tests
           filters:
             tags:
               only: /^v.*/
